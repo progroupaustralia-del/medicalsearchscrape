@@ -81,6 +81,7 @@ CONFIG = {
     "headless": False,          # keep visible so you can log in / solve any challenge
     "profile_dir": ".ms_profile",  # persistent browser profile (keeps you logged in)
     "output_csv": "contacts.csv",
+    "debug_dump": True,         # write page_dump.html + sample_item.html on page 1
 }
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +274,23 @@ def main():
             if not items:
                 print("  no listings found on this page — stopping.")
                 break
+
+            # DEBUG: on the first page, dump HTML so the selectors can be tuned
+            # against the real structure. These files are git-ignored.
+            if page_index == 1 and CONFIG.get("debug_dump"):
+                try:
+                    with open("page_dump.html", "w", encoding="utf-8") as fh:
+                        fh.write(page.content())
+                    sample_html = items[0].evaluate("el => el.outerHTML")
+                    with open("sample_item.html", "w", encoding="utf-8") as fh:
+                        fh.write(sample_html)
+                    print(
+                        "  [debug] wrote page_dump.html (full page) and "
+                        "sample_item.html (first listing). Send sample_item.html "
+                        "to tune selectors."
+                    )
+                except Exception as e:
+                    print(f"  [debug] dump failed: {e}")
 
             new_on_page = 0
             for it in items:

@@ -8,3 +8,7 @@ __pycache__/
 
 # Scraped output — contains personal contact data; don't commit
 contacts.csv
+
+# Debug HTML dumps
+page_dump.html
+sample_item.html
