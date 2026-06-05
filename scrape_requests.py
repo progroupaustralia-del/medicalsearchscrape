@@ -171,33 +171,46 @@ def click_exact(page, label) -> bool:
 
 
 def goto_next(page) -> bool:
-    """Click the pagination 'Next' control if it exists, is visible and enabled."""
+    """
+    Advance to the next page of results.
+
+    The site renders more than one 'Next' control (e.g. a hidden mobile one and
+    the visible desktop one), so we try every candidate, skip the ones that are
+    hidden or marked disabled, scroll the real one into view, and click it via
+    JavaScript (which isn't blocked by visibility/overlay quirks).
+    """
     try:
-        el = page.query_selector(
+        candidates = page.query_selector_all(
             "xpath=//a[normalize-space()='Next'] | //button[normalize-space()='Next']"
         )
-        if not el:
-            return False
-        cls = (el.get_attribute("class") or "").lower()
-        aria = (el.get_attribute("aria-disabled") or "").lower()
-        parent_cls = ""
-        try:
-            parent_cls = (el.evaluate("e => e.parentElement ? e.parentElement.className : ''") or "").lower()
-        except Exception:
-            pass
-        # On the last page the control is hidden or marked disabled — stop cleanly
-        # instead of waiting for it to become clickable.
-        if "disabled" in cls or "disabled" in parent_cls or aria == "true":
-            return False
-        if not el.is_visible() or not el.is_enabled():
-            return False
-        el.click(timeout=5000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except PWTimeout:
-            pass
-        time.sleep(1.2)
-        return True
+        for el in candidates:
+            cls = (el.get_attribute("class") or "").lower()
+            aria = (el.get_attribute("aria-disabled") or "").lower()
+            parent_cls = ""
+            try:
+                parent_cls = (el.evaluate("e => e.parentElement ? e.parentElement.className : ''") or "").lower()
+            except Exception:
+                pass
+            if "disabled" in cls or "disabled" in parent_cls or aria == "true":
+                continue  # last page for this control
+            try:
+                el.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                el.evaluate("e => e.click()")
+            except Exception:
+                try:
+                    el.click(timeout=5000)
+                except Exception:
+                    continue
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except PWTimeout:
+                pass
+            time.sleep(1.4)
+            return True
+        return False
     except Exception as e:
         print(f"  next-page click failed: {e}")
         return False
