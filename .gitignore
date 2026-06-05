@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Playwright persistent browser profile (may contain your session/cookies)
+.ms_profile/
+
+# Scraped output — contains personal contact data; don't commit
+contacts.csv
