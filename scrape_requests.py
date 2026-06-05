@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Scrape contacts (Name / Email / Phone / Address) from the MedicalSearch
-supplier requests / accepted-leads area and write them to contacts.csv.
+Scrape your ACCEPTED leads (Name / Email / Phone / Address) from MedicalSearch
+and write them to contacts.csv.
 
-WHY THIS RUNS LOCALLY:
-  The page is behind a login and behind bot protection. This script drives a
-  real Chromium browser that YOU log into, so your credentials never leave your
-  machine and are never stored by the script.
+IMPORTANT — which tab to use:
+  MedicalSearch HIDES the buyer's phone and email on the "Invited" tab
+  (you'll see things like "0402 77..." and "name@gm..." with "Accept to view
+  & quote"). The FULL details only show on the "Accepted" tab — the leads you
+  have already accepted. This script switches to the Accepted tab for you and
+  pauses so you can confirm full details are visible before it scrapes.
 
-HOW IT FINDS CONTACTS (class-name independent):
-  Each lead card on the page shows a name, a company + location line, a phone,
-  and an email. Rather than depend on the site's HTML class names (which change
-  and are easy to get wrong), this script locates every email on the page, then
-  for each email picks the smallest surrounding block that also contains a phone
-  number and a "(SUBURB, POSTCODE STATE)" location line, and reads the name from
-  the line directly above that location. That makes it robust to layout changes.
+WHY IT RUNS LOCALLY:
+  The page is behind your login. This drives a real browser that YOU log into;
+  your credentials never leave your machine and are never stored by the script.
 
 SETUP (one time):
     pip3 install -r requirements.txt
@@ -39,85 +37,25 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # --------------------------------------------------------------------------- #
 CONFIG = {
     "start_url": "https://sma.medicalsearch.com.au/requests",
-
-    # Pagination: the script first tries clicking a "next" control. If the page
-    # instead uses ?page=N in the URL, set use_page_param=True.
-    "next_selector": "a[rel='next'], a[class*='next'], button[class*='next'], [aria-label*='Next']",
-    "use_page_param": False,
-    "page_param": "page",
-
-    "max_pages": 200,            # hard safety cap
+    "tab": "Accepted",           # which sub-tab to scrape: Accepted / Invited / Archived
+    "max_pages": 100,            # hard safety cap
     "wait_after_load_ms": 1500,  # let JS-rendered content settle
-    "headless": False,           # keep visible so you can log in
+    "headless": False,           # keep visible so you can log in / confirm the tab
     "profile_dir": ".ms_profile",  # persistent browser profile (keeps you logged in)
     "output_csv": "contacts.csv",
-    "debug_dump": True,          # write page_dump.html on page 1 for troubleshooting
+    "debug_dump": True,          # write page_text.txt on page 1 for troubleshooting
 }
 
-# Python-side regexes (mirror the JS ones used in the browser).
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(
     r"(?:\+?61[\s\-]?|\(?0\)?[\s\-]?)?(?:\(?0?[1-9]\)?[\s\-]?)?\d(?:[\s\-]?\d){7,9}"
 )
-LOCATION_RE = re.compile(r"\([^)]*\b\d{3,4}\b[^)]*\)")
-
-# --------------------------------------------------------------------------- #
-# In-browser extraction. Runs inside the page and returns one record per email.
-# --------------------------------------------------------------------------- #
-EXTRACT_JS = r"""
-() => {
-  const EMAIL_G = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
-  const PHONE = /(?:\+?61[\s\-]?|\(?0\)?[\s\-]?)?(?:\(?0?[1-9]\)?[\s\-]?)?\d(?:[\s\-]?\d){7,9}/;
-  const LOC = /\([^)]*\b\d{3,4}\b[^)]*\)/;
-  const LABEL = /^(accepted\b|buyer|use:|type needed|procedures|wavelength|cooling|budget|send\s*quote|archive|view|reject|decline|message)/i;
-
-  function nameAbove(text){
-    const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
-    let li = -1;
-    for (let i = 0; i < lines.length; i++){ if (LOC.test(lines[i])){ li = i; break; } }
-    if (li <= 0) return null;
-    for (let i = li - 1; i >= 0; i--){
-      const l = lines[i];
-      if (/[0-9@]/.test(l)) continue;       // skip dates / emails
-      if (LABEL.test(l)) continue;          // skip known labels / buttons
-      if (l.length < 2 || l.length > 50) continue;
-      return l;
-    }
-    return null;
-  }
-
-  const all = Array.from(document.querySelectorAll('body *'));
-  const byEmail = {};
-  for (const el of all){
-    const t = el.innerText || '';
-    if (t.indexOf('@') < 0) continue;
-    const found = t.match(EMAIL_G);
-    if (!found) continue;
-    const uniq = [...new Set(found.map(e => e.toLowerCase()))];
-    if (uniq.length !== 1) continue;        // skip containers holding many cards
-    (byEmail[uniq[0]] = byEmail[uniq[0]] || []).push(el);
-  }
-
-  const out = [];
-  for (const email in byEmail){
-    // Smallest element first: walk from the tight email block outward.
-    const chain = byEmail[email].sort((a, b) => a.innerText.length - b.innerText.length);
-    let chosen = null, chosenName = null;
-    for (const el of chain){
-      const t = el.innerText;
-      if (!PHONE.test(t)) continue;
-      if (!LOC.test(t)) continue;
-      const nm = nameAbove(t);
-      if (nm){ chosen = el; chosenName = nm; break; }
-    }
-    if (!chosen){                            // fallback: smallest block with a phone
-      for (const el of chain){ if (PHONE.test(el.innerText)){ chosen = el; break; } }
-    }
-    if (!chosen) chosen = chain[chain.length - 1];
-    out.push({ email: email, name: chosenName || '', text: chosen.innerText });
-  }
-  return out;
-}
-"""
+# A lead's location line, e.g. "Clinic Name (SUBURB, 3123 VIC)" or "(6053 WA)".
+# Requires a postcode followed by an Australian state (or "United States"), which
+# avoids matching parenthetical numbers inside the buyer's message / specs.
+LOCATION_RE = re.compile(
+    r"\([^)]*\b\d{3,5}\s+(?:NSW|VIC|QLD|SA|WA|TAS|NT|ACT|United States)\s*\)"
+)
 
 
 @dataclass
@@ -135,36 +73,73 @@ def _clean_phone(raw: str) -> str:
     return ""
 
 
-def parse_cards(page) -> list[Contact]:
-    """Run the in-browser extractor and turn each record into a Contact."""
-    records = page.evaluate(EXTRACT_JS)
-    out: list[Contact] = []
-    for r in records:
-        text = r.get("text", "")
-        c = Contact(email=(r.get("email", "") or "").strip(), name=(r.get("name", "") or "").strip())
+def parse_cards(page):
+    """
+    Parse the page's visible text into leads.
 
-        # Phone: first regex match in the card text that passes a length check.
-        for m in PHONE_RE.finditer(text):
-            cleaned = _clean_phone(m.group(0))
-            if cleaned:
-                c.phone = cleaned
+    Each lead card renders as a run of lines like:
+        <title>
+        <date>
+        <name>
+        <company> (<suburb>, <postcode> <state>)   <- located by LOCATION_RE
+        <phone>
+        <email>
+        Buyer's Message: ...
+    We anchor on the location line: the name is the line directly above it, and
+    the phone/email are the next lines below it (before "Buyer's Message").
+
+    Returns (contacts, masked_count) where masked_count counts cards whose
+    details are hidden ("Accept to view & quote") — a sign of the wrong tab.
+    """
+    text = page.evaluate("document.body.innerText") or ""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    n = len(lines)
+
+    contacts = []
+    masked = 0
+    for i in range(n):
+        if not LOCATION_RE.search(lines[i]):
+            continue
+        address = lines[i]
+        name = lines[i - 1] if i >= 1 else ""
+
+        phone = ""
+        email = ""
+        is_masked = False
+        for j in range(i + 1, min(i + 10, n)):
+            lj = lines[j]
+            if LOCATION_RE.search(lj) or lj.lower().startswith("buyer's message"):
+                break
+            if "accept to view" in lj.lower():
+                is_masked = True
+            if not phone:
+                m = PHONE_RE.search(lj)
+                if m:
+                    cleaned = _clean_phone(m.group(0))
+                    if cleaned:
+                        phone = cleaned
+            if not email and "@" in lj:
+                em = EMAIL_RE.search(lj)
+                if em:
+                    email = em.group(0)
+                else:
+                    is_masked = True  # truncated like "name@gm..."
+            if phone and email:
                 break
 
-        # Address: the company + "(SUBURB, POSTCODE STATE)" line.
-        for line in text.splitlines():
-            line = line.strip()
-            if line and LOCATION_RE.search(line):
-                c.address = " ".join(line.split())
-                break
+        if is_masked:
+            masked += 1
+        # Keep the card if we got at least a name + a location.
+        if name and address:
+            contacts.append(Contact(name=name, email=email, phone=phone, address=address))
 
-        out.append(c)
-    return out
+    return contacts, masked
 
 
 def auto_scroll(page):
-    """Scroll to the bottom a few times so lazy-loaded cards render."""
+    """Scroll down repeatedly so lazy-loaded cards render, then back to top."""
     last = 0
-    for _ in range(20):
+    for _ in range(25):
         height = page.evaluate("document.body.scrollHeight")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(0.4)
@@ -174,31 +149,59 @@ def auto_scroll(page):
     page.evaluate("window.scrollTo(0, 0)")
 
 
-def goto_next(page, page_index) -> bool:
-    if CONFIG["use_page_param"]:
-        sep = "&" if "?" in CONFIG["start_url"] else "?"
-        url = f"{CONFIG['start_url']}{sep}{CONFIG['page_param']}={page_index + 1}"
-        page.goto(url, wait_until="domcontentloaded")
-        return True
+def click_exact(page, label) -> bool:
+    """Click the first link/button/tab whose trimmed text equals `label`."""
+    xpath = (
+        "xpath=//*[self::a or self::button or self::li or self::span or self::div]"
+        f"[normalize-space(text())='{label}']"
+    )
     try:
-        nxt = page.query_selector(CONFIG["next_selector"])
-        if nxt:
-            disabled = (nxt.get_attribute("disabled") is not None) or (
-                "disabled" in (nxt.get_attribute("class") or "")
-            )
-            if disabled:
-                return False
-            nxt.click()
-            page.wait_for_load_state("domcontentloaded")
+        el = page.query_selector(xpath)
+        if el:
+            el.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except PWTimeout:
+                pass
+            time.sleep(1.2)
             return True
     except Exception as e:
-        print(f"  next-page click failed: {e}")
+        print(f"  click '{label}' failed: {e}")
     return False
+
+
+def goto_next(page) -> bool:
+    """Click the pagination 'Next' control if it exists and is enabled."""
+    try:
+        el = page.query_selector(
+            "xpath=//a[normalize-space()='Next'] | //button[normalize-space()='Next']"
+        )
+        if not el:
+            return False
+        cls = (el.get_attribute("class") or "").lower()
+        parent_cls = ""
+        try:
+            parent_cls = (el.evaluate("e => e.parentElement ? e.parentElement.className : ''") or "").lower()
+        except Exception:
+            pass
+        if "disabled" in cls or "disabled" in parent_cls:
+            return False
+        el.click()
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            pass
+        time.sleep(1.2)
+        return True
+    except Exception as e:
+        print(f"  next-page click failed: {e}")
+        return False
 
 
 def main():
     seen = set()
     contacts: list[Contact] = []
+    total_masked = 0
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
@@ -213,12 +216,20 @@ def main():
         time.sleep(CONFIG["wait_after_load_ms"] / 1000)
 
         if "login" in page.url.lower() or "signin" in page.url.lower():
-            input(
-                "\n>> Please LOG IN in the browser window, navigate to the page "
-                "with the leads\n   you want, then come back here and press Enter "
-                "to start scraping... "
-            )
+            input("\n>> Please LOG IN in the browser window, then press Enter... ")
             time.sleep(CONFIG["wait_after_load_ms"] / 1000)
+
+        # Switch to the desired tab (Accepted) so full details are visible.
+        if CONFIG.get("tab"):
+            print(f"Selecting the '{CONFIG['tab']}' tab ...")
+            click_exact(page, CONFIG["tab"])
+
+        input(
+            f"\n>> The page should now show your {CONFIG.get('tab','')} leads with FULL\n"
+            "   emails and phone numbers (not '...' / 'Accept to view'). If not, click\n"
+            f"   the '{CONFIG.get('tab','Accepted')}' tab yourself now.\n"
+            "   Press Enter to start scraping... "
+        )
 
         for page_index in range(1, CONFIG["max_pages"] + 1):
             print(f"\nPage {page_index}: {page.url}")
@@ -231,34 +242,33 @@ def main():
 
             if page_index == 1 and CONFIG.get("debug_dump"):
                 try:
-                    with open("page_dump.html", "w", encoding="utf-8") as fh:
-                        fh.write(page.content())
-                    # Plain readable text of the page — small and easy to share.
                     txt = page.evaluate("document.body.innerText") or ""
                     with open("page_text.txt", "w", encoding="utf-8") as fh:
                         fh.write(txt[:60000])
-                    print("  [debug] wrote page_text.txt — paste it to tune extraction.")
                 except Exception as e:
                     print(f"  [debug] dump failed: {e}")
 
-            cards = parse_cards(page)
+            cards, masked = parse_cards(page)
+            total_masked += masked
             new_on_page = 0
             for c in cards:
-                key = (c.email or f"{c.name}|{c.phone}").lower()
-                if not key.strip("|") or key in seen:
+                key = (c.email or f"{c.name}|{c.phone}|{c.address}").lower()
+                if key in seen:
                     continue
                 seen.add(key)
                 contacts.append(c)
                 new_on_page += 1
-            print(f"  found {len(cards)} cards, +{new_on_page} new (total {len(contacts)})")
+            print(
+                f"  found {len(cards)} cards, +{new_on_page} new "
+                f"(total {len(contacts)}){', some HIDDEN' if masked else ''}"
+            )
 
             if new_on_page == 0 and page_index > 1:
                 print("  no new contacts — stopping.")
                 break
-            if not goto_next(page, page_index):
+            if not goto_next(page):
                 print("  no next page — done.")
                 break
-            time.sleep(0.8)
 
         ctx.close()
 
@@ -270,11 +280,21 @@ def main():
             w.writerow(asdict(c))
 
     print(f"\nDone. Wrote {len(contacts)} contacts to {CONFIG['output_csv']}")
+
+    with_email = sum(1 for c in contacts if c.email)
+    if total_masked and with_email < len(contacts) / 2:
+        print(
+            "\n!! WARNING: many leads had HIDDEN details ('Accept to view & quote').\n"
+            "   You're probably on the 'Invited' tab. Re-run and make sure the\n"
+            "   'Accepted' tab is selected — that's where full emails/phones show."
+        )
+    elif contacts:
+        print(f"   ({with_email} of {len(contacts)} have an email address.)")
     if not contacts:
         print(
-            "No contacts captured. If you can see leads on the page, the layout may\n"
-            "differ from what's expected — paste me the contents of page_dump.html\n"
-            "(run:  cat page_dump.html | pbcopy  then paste here) and I'll adjust."
+            "No leads found. If you can see leads on the page, run\n"
+            "   cat page_text.txt | pbcopy\n"
+            "and paste the result so the parser can be adjusted."
         )
 
 
