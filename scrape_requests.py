@@ -233,6 +233,11 @@ def main():
                 try:
                     with open("page_dump.html", "w", encoding="utf-8") as fh:
                         fh.write(page.content())
+                    # Plain readable text of the page — small and easy to share.
+                    txt = page.evaluate("document.body.innerText") or ""
+                    with open("page_text.txt", "w", encoding="utf-8") as fh:
+                        fh.write(txt[:60000])
+                    print("  [debug] wrote page_text.txt — paste it to tune extraction.")
                 except Exception as e:
                     print(f"  [debug] dump failed: {e}")
 
