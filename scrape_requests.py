@@ -1,37 +1,27 @@
 #!/usr/bin/env python3
 """
 Scrape contacts (Name / Email / Phone / Address) from the MedicalSearch
-supplier "requests" area and write them to contacts.csv.
+supplier requests / accepted-leads area and write them to contacts.csv.
 
-WHY THIS RUNS LOCALLY (not in CI / not on a server you don't control):
-  - The target page (https://sma.medicalsearch.com.au/requests) sits behind a
-    login and behind bot/WAF protection. The reliable way past both is to drive
-    a *real* browser that YOU log into. Your credentials stay on your machine —
-    they are never typed into this script and never stored by it.
+WHY THIS RUNS LOCALLY:
+  The page is behind a login and behind bot protection. This script drives a
+  real Chromium browser that YOU log into, so your credentials never leave your
+  machine and are never stored by the script.
 
-HOW IT WORKS:
-  1. Opens a real Chromium window using a *persistent* profile (so you only have
-     to log in once; the session is reused on later runs).
-  2. On the first run it pauses and waits for you to log in by hand, then press
-     Enter in the terminal.
-  3. Navigates to the requests listing, walks every page of results, and pulls
-     out Name / Email / Phone / Address from each row.
-  4. De-duplicates and writes contacts.csv.
+HOW IT FINDS CONTACTS (class-name independent):
+  Each lead card on the page shows a name, a company + location line, a phone,
+  and an email. Rather than depend on the site's HTML class names (which change
+  and are easy to get wrong), this script locates every email on the page, then
+  for each email picks the smallest surrounding block that also contains a phone
+  number and a "(SUBURB, POSTCODE STATE)" location line, and reads the name from
+  the line directly above that location. That makes it robust to layout changes.
 
 SETUP (one time):
-    python3 -m venv .venv
-    source .venv/bin/activate            # Windows: .venv\\Scripts\\activate
-    pip install -r requirements.txt
-    python -m playwright install chromium
+    pip3 install -r requirements.txt
+    python3 -m playwright install chromium
 
 RUN:
-    python scrape_requests.py
-
-TUNING THE SELECTORS:
-  The CONFIG block below is the only thing you should normally need to touch.
-  After your first run, open the page in your browser, right-click a listing,
-  choose "Inspect", and copy the CSS selector / class names into CONFIG. If you
-  paste that HTML back to me I'll set these precisely for you.
+    python3 scrape_requests.py
 """
 
 from __future__ import annotations
@@ -45,64 +35,89 @@ from dataclasses import dataclass, asdict, fields
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # --------------------------------------------------------------------------- #
-# CONFIG — adjust these to match the real page once you can see its HTML.
+# CONFIG
 # --------------------------------------------------------------------------- #
 CONFIG = {
-    # Where the listings live.
     "start_url": "https://sma.medicalsearch.com.au/requests",
 
-    # CSS selector that matches ONE listing/row. The defaults below are common
-    # patterns; replace with the real one after inspecting the page. Multiple
-    # candidates are tried in order until one matches something.
-    "item_selectors": [
-        "[class*='request']",
-        "article",
-        "li[class*='card']",
-        "div[class*='card']",
-        "tr",
-    ],
-
-    # Within a single item, where to read the name from. First match wins.
-    "name_selectors": ["h1", "h2", "h3", "h4", "a[class*='title']", "[class*='name']", "[class*='title']"],
-
-    # Within a single item, where to read the address from (optional; falls back
-    # to a heuristic over the item's text if none match).
-    "address_selectors": ["[class*='address']", "[class*='location']", "address"],
-
-    # How to advance to the next page. The script tries, in order:
-    #   1) clicking a "next" control matching next_selector
-    #   2) appending ?page=N to start_url (set use_page_param=True)
+    # Pagination: the script first tries clicking a "next" control. If the page
+    # instead uses ?page=N in the URL, set use_page_param=True.
     "next_selector": "a[rel='next'], a[class*='next'], button[class*='next'], [aria-label*='Next']",
     "use_page_param": False,
     "page_param": "page",
 
-    "max_pages": 200,          # hard safety cap
+    "max_pages": 200,            # hard safety cap
     "wait_after_load_ms": 1500,  # let JS-rendered content settle
-    "headless": False,          # keep visible so you can log in / solve any challenge
+    "headless": False,           # keep visible so you can log in
     "profile_dir": ".ms_profile",  # persistent browser profile (keeps you logged in)
     "output_csv": "contacts.csv",
-    "debug_dump": True,         # write page_dump.html + sample_item.html on page 1
+    "debug_dump": True,          # write page_dump.html on page 1 for troubleshooting
 }
 
-# --------------------------------------------------------------------------- #
-# Extraction helpers
-# --------------------------------------------------------------------------- #
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-
-# Australian-friendly phone matcher: mobiles (04xx), landlines with optional
-# area code, +61 international, and common separators / brackets.
+# Python-side regexes (mirror the JS ones used in the browser).
 PHONE_RE = re.compile(
     r"(?:\+?61[\s\-]?|\(?0\)?[\s\-]?)?(?:\(?0?[1-9]\)?[\s\-]?)?\d(?:[\s\-]?\d){7,9}"
 )
+LOCATION_RE = re.compile(r"\([^)]*\b\d{3,4}\b[^)]*\)")
 
-# A loose address heuristic: a line containing a street-type word or an
-# Australian state + 4-digit postcode.
-ADDRESS_HINT_RE = re.compile(
-    r"(?i)\b(?:unit|suite|level|floor|p\.?o\.?\s*box|"
-    r"st(?:reet)?|rd|road|ave|avenue|dr(?:ive)?|hwy|highway|"
-    r"ln|lane|ct|court|pl(?:ace)?|tce|terrace|cres(?:cent)?|blvd|parade|pde)\b"
-    r"|\b(?:NSW|VIC|QLD|SA|WA|TAS|NT|ACT)\b\s*\d{4}"
-)
+# --------------------------------------------------------------------------- #
+# In-browser extraction. Runs inside the page and returns one record per email.
+# --------------------------------------------------------------------------- #
+EXTRACT_JS = r"""
+() => {
+  const EMAIL_G = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+  const PHONE = /(?:\+?61[\s\-]?|\(?0\)?[\s\-]?)?(?:\(?0?[1-9]\)?[\s\-]?)?\d(?:[\s\-]?\d){7,9}/;
+  const LOC = /\([^)]*\b\d{3,4}\b[^)]*\)/;
+  const LABEL = /^(accepted\b|buyer|use:|type needed|procedures|wavelength|cooling|budget|send\s*quote|archive|view|reject|decline|message)/i;
+
+  function nameAbove(text){
+    const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+    let li = -1;
+    for (let i = 0; i < lines.length; i++){ if (LOC.test(lines[i])){ li = i; break; } }
+    if (li <= 0) return null;
+    for (let i = li - 1; i >= 0; i--){
+      const l = lines[i];
+      if (/[0-9@]/.test(l)) continue;       // skip dates / emails
+      if (LABEL.test(l)) continue;          // skip known labels / buttons
+      if (l.length < 2 || l.length > 50) continue;
+      return l;
+    }
+    return null;
+  }
+
+  const all = Array.from(document.querySelectorAll('body *'));
+  const byEmail = {};
+  for (const el of all){
+    const t = el.innerText || '';
+    if (t.indexOf('@') < 0) continue;
+    const found = t.match(EMAIL_G);
+    if (!found) continue;
+    const uniq = [...new Set(found.map(e => e.toLowerCase()))];
+    if (uniq.length !== 1) continue;        // skip containers holding many cards
+    (byEmail[uniq[0]] = byEmail[uniq[0]] || []).push(el);
+  }
+
+  const out = [];
+  for (const email in byEmail){
+    // Smallest element first: walk from the tight email block outward.
+    const chain = byEmail[email].sort((a, b) => a.innerText.length - b.innerText.length);
+    let chosen = null, chosenName = null;
+    for (const el of chain){
+      const t = el.innerText;
+      if (!PHONE.test(t)) continue;
+      if (!LOC.test(t)) continue;
+      const nm = nameAbove(t);
+      if (nm){ chosen = el; chosenName = nm; break; }
+    }
+    if (!chosen){                            // fallback: smallest block with a phone
+      for (const el of chain){ if (PHONE.test(el.innerText)){ chosen = el; break; } }
+    }
+    if (!chosen) chosen = chain[chain.length - 1];
+    out.push({ email: email, name: chosenName || '', text: chosen.innerText });
+  }
+  return out;
+}
+"""
 
 
 @dataclass
@@ -112,113 +127,59 @@ class Contact:
     phone: str = ""
     address: str = ""
 
-    def is_empty(self) -> bool:
-        return not any((self.name, self.email, self.phone, self.address))
-
-    def key(self):
-        # De-dup key: prefer email, else name+phone.
-        return (self.email or "").lower() or f"{self.name}|{self.phone}".lower()
-
-
-def _first_text(item, selectors) -> str:
-    for sel in selectors:
-        try:
-            el = item.query_selector(sel)
-            if el:
-                txt = (el.inner_text() or "").strip()
-                if txt:
-                    return " ".join(txt.split())
-        except Exception:
-            continue
-    return ""
-
 
 def _clean_phone(raw: str) -> str:
-    digits = re.sub(r"[^\d+]", "", raw)
-    # Require a plausible AU length (8-12 incl. country code) to avoid matching
-    # random numbers like prices or IDs.
-    only_digits = re.sub(r"\D", "", digits)
+    only_digits = re.sub(r"\D", "", raw)
     if 8 <= len(only_digits) <= 12:
-        return raw.strip()
+        return " ".join(raw.split())
     return ""
 
 
-def extract_contact(item) -> Contact:
-    """Pull a Contact out of a single listing element."""
-    full_text = ""
-    try:
-        full_text = item.inner_text() or ""
-    except Exception:
-        pass
+def parse_cards(page) -> list[Contact]:
+    """Run the in-browser extractor and turn each record into a Contact."""
+    records = page.evaluate(EXTRACT_JS)
+    out: list[Contact] = []
+    for r in records:
+        text = r.get("text", "")
+        c = Contact(email=(r.get("email", "") or "").strip(), name=(r.get("name", "") or "").strip())
 
-    c = Contact()
-
-    # Name
-    c.name = _first_text(item, CONFIG["name_selectors"])
-
-    # Email — prefer mailto links, then regex over text.
-    try:
-        mailto = item.query_selector("a[href^='mailto:']")
-        if mailto:
-            href = mailto.get_attribute("href") or ""
-            c.email = href.split("mailto:", 1)[-1].split("?")[0].strip()
-    except Exception:
-        pass
-    if not c.email:
-        m = EMAIL_RE.search(full_text)
-        if m:
-            c.email = m.group(0)
-
-    # Phone — prefer tel: links, then regex.
-    try:
-        tel = item.query_selector("a[href^='tel:']")
-        if tel:
-            href = tel.get_attribute("href") or ""
-            c.phone = href.split("tel:", 1)[-1].strip()
-    except Exception:
-        pass
-    if not c.phone:
-        for m in PHONE_RE.finditer(full_text):
+        # Phone: first regex match in the card text that passes a length check.
+        for m in PHONE_RE.finditer(text):
             cleaned = _clean_phone(m.group(0))
             if cleaned:
                 c.phone = cleaned
                 break
 
-    # Address — selector first, then heuristic line scan.
-    c.address = _first_text(item, CONFIG["address_selectors"])
-    if not c.address:
-        for line in (l.strip() for l in full_text.splitlines()):
-            if line and ADDRESS_HINT_RE.search(line):
+        # Address: the company + "(SUBURB, POSTCODE STATE)" line.
+        for line in text.splitlines():
+            line = line.strip()
+            if line and LOCATION_RE.search(line):
                 c.address = " ".join(line.split())
                 break
 
-    return c
+        out.append(c)
+    return out
 
 
-# --------------------------------------------------------------------------- #
-# Page walking
-# --------------------------------------------------------------------------- #
-def find_items(page):
-    """Return the list of listing elements using the first selector that hits."""
-    for sel in CONFIG["item_selectors"]:
-        items = page.query_selector_all(sel)
-        if items and len(items) >= 1:
-            # Avoid catching the whole document with an overly broad selector:
-            # require at least 2 matches OR a selector that's clearly specific.
-            if len(items) >= 2 or "request" in sel or "card" in sel:
-                print(f"  using item selector: {sel!r}  ({len(items)} matches)")
-                return items
-    return []
+def auto_scroll(page):
+    """Scroll to the bottom a few times so lazy-loaded cards render."""
+    last = 0
+    for _ in range(20):
+        height = page.evaluate("document.body.scrollHeight")
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.4)
+        if height == last:
+            break
+        last = height
+    page.evaluate("window.scrollTo(0, 0)")
 
 
 def goto_next(page, page_index) -> bool:
-    """Advance to the next page. Returns True if it navigated, False if done."""
     if CONFIG["use_page_param"]:
         sep = "&" if "?" in CONFIG["start_url"] else "?"
         url = f"{CONFIG['start_url']}{sep}{CONFIG['page_param']}={page_index + 1}"
         page.goto(url, wait_until="domcontentloaded")
         return True
-
     try:
         nxt = page.query_selector(CONFIG["next_selector"])
         if nxt:
@@ -236,7 +197,6 @@ def goto_next(page, page_index) -> bool:
 
 
 def main():
-    out_path = CONFIG["output_csv"]
     seen = set()
     contacts: list[Contact] = []
 
@@ -252,14 +212,12 @@ def main():
         page.goto(CONFIG["start_url"], wait_until="domcontentloaded")
         time.sleep(CONFIG["wait_after_load_ms"] / 1000)
 
-        # If we got bounced to a login page, wait for the human.
         if "login" in page.url.lower() or "signin" in page.url.lower():
             input(
-                "\n>> Please LOG IN in the browser window, navigate to the "
-                "requests page if needed,\n   then come back here and press "
-                "Enter to start scraping... "
+                "\n>> Please LOG IN in the browser window, navigate to the page "
+                "with the leads\n   you want, then come back here and press Enter "
+                "to start scraping... "
             )
-            page.goto(CONFIG["start_url"], wait_until="domcontentloaded")
             time.sleep(CONFIG["wait_after_load_ms"] / 1000)
 
         for page_index in range(1, CONFIG["max_pages"] + 1):
@@ -269,64 +227,49 @@ def main():
             except PWTimeout:
                 pass
             time.sleep(CONFIG["wait_after_load_ms"] / 1000)
+            auto_scroll(page)
 
-            items = find_items(page)
-            if not items:
-                print("  no listings found on this page — stopping.")
-                break
-
-            # DEBUG: on the first page, dump HTML so the selectors can be tuned
-            # against the real structure. These files are git-ignored.
             if page_index == 1 and CONFIG.get("debug_dump"):
                 try:
                     with open("page_dump.html", "w", encoding="utf-8") as fh:
                         fh.write(page.content())
-                    sample_html = items[0].evaluate("el => el.outerHTML")
-                    with open("sample_item.html", "w", encoding="utf-8") as fh:
-                        fh.write(sample_html)
-                    print(
-                        "  [debug] wrote page_dump.html (full page) and "
-                        "sample_item.html (first listing). Send sample_item.html "
-                        "to tune selectors."
-                    )
                 except Exception as e:
                     print(f"  [debug] dump failed: {e}")
 
+            cards = parse_cards(page)
             new_on_page = 0
-            for it in items:
-                c = extract_contact(it)
-                if c.is_empty():
+            for c in cards:
+                key = (c.email or f"{c.name}|{c.phone}").lower()
+                if not key.strip("|") or key in seen:
                     continue
-                k = c.key()
-                if k in seen:
-                    continue
-                seen.add(k)
+                seen.add(key)
                 contacts.append(c)
                 new_on_page += 1
-            print(f"  +{new_on_page} new contacts (total {len(contacts)})")
+            print(f"  found {len(cards)} cards, +{new_on_page} new (total {len(contacts)})")
 
+            if new_on_page == 0 and page_index > 1:
+                print("  no new contacts — stopping.")
+                break
             if not goto_next(page, page_index):
                 print("  no next page — done.")
                 break
-            time.sleep(0.8)  # be polite
+            time.sleep(0.8)
 
         ctx.close()
 
-    # Write CSV
     cols = [f.name for f in fields(Contact)]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+    with open(CONFIG["output_csv"], "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for c in contacts:
             w.writerow(asdict(c))
 
-    print(f"\nDone. Wrote {len(contacts)} contacts to {out_path}")
+    print(f"\nDone. Wrote {len(contacts)} contacts to {CONFIG['output_csv']}")
     if not contacts:
         print(
-            "No contacts captured. The selectors in CONFIG almost certainly need\n"
-            "to match the real page — inspect a listing element and update\n"
-            "CONFIG['item_selectors'] / ['name_selectors'] etc. (or paste the\n"
-            "page HTML and I'll set them for you)."
+            "No contacts captured. If you can see leads on the page, the layout may\n"
+            "differ from what's expected — paste me the contents of page_dump.html\n"
+            "(run:  cat page_dump.html | pbcopy  then paste here) and I'll adjust."
         )
 
 
