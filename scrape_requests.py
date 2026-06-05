@@ -171,7 +171,7 @@ def click_exact(page, label) -> bool:
 
 
 def goto_next(page) -> bool:
-    """Click the pagination 'Next' control if it exists and is enabled."""
+    """Click the pagination 'Next' control if it exists, is visible and enabled."""
     try:
         el = page.query_selector(
             "xpath=//a[normalize-space()='Next'] | //button[normalize-space()='Next']"
@@ -179,14 +179,19 @@ def goto_next(page) -> bool:
         if not el:
             return False
         cls = (el.get_attribute("class") or "").lower()
+        aria = (el.get_attribute("aria-disabled") or "").lower()
         parent_cls = ""
         try:
             parent_cls = (el.evaluate("e => e.parentElement ? e.parentElement.className : ''") or "").lower()
         except Exception:
             pass
-        if "disabled" in cls or "disabled" in parent_cls:
+        # On the last page the control is hidden or marked disabled — stop cleanly
+        # instead of waiting for it to become clickable.
+        if "disabled" in cls or "disabled" in parent_cls or aria == "true":
             return False
-        el.click()
+        if not el.is_visible() or not el.is_enabled():
+            return False
+        el.click(timeout=5000)
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except PWTimeout:
