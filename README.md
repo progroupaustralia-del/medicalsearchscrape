@@ -1,3 +1,13 @@
+# Clinic scrapers
+
+This repo contains two tools:
+
+1. **`clinic_scraper.py`** — Melbourne clinic phone numbers & emails (see below).
+2. **`candela_scraper.py`** — finds NSW aesthetic/skin/laser clinics that use a
+   **Candela** device (see [NSW Candela-device prospector](#nsw-candela-device-prospector)).
+
+---
+
 # Melbourne Clinic Contact Scraper
 
 A small, no-API-key tool that collects **publicly published** phone numbers and
@@ -90,3 +100,84 @@ republish derived data, attribute OpenStreetMap accordingly.
   incomplete. The website crawl fills in many missing emails but not all.
 - The two public Overpass mirrors used here are shared community resources.
   Don't hammer them — run the tool occasionally, not in a tight loop.
+
+---
+
+# NSW Candela-device prospector
+
+`candela_scraper.py` finds aesthetic / cosmetic / skin / laser clinics across
+New South Wales and flags the ones that **publicly advertise a Candela device**
+(GentleLase, GentleMax Pro, Vbeam, PicoWay, Nordlys, CO2RE, Profound Matrix,
+Exion, AlexTriVantage, Frax, …). "Eligible" means the clinic mentions a Candela
+device on its website or linked social page.
+
+### How it works
+
+1. **OpenStreetMap (Overpass API)** → candidate aesthetic clinics in NSW that
+   have a website. Generic GP clinics are filtered out by tag/name.
+2. **Website crawl** → for each clinic it visits the homepage plus likely
+   treatment/technology/laser pages and scans the text for Candela product
+   names. Respects `robots.txt`, rate-limited.
+3. **Social check (best-effort)** → detects the clinic's linked Instagram /
+   Facebook and attempts the public page. **Note:** Instagram and Facebook
+   actively block automated access and usually serve a login wall, and bulk
+   scraping breaks their Terms of Service — so this is unreliable by design.
+   The social URLs are always saved to the CSV so you can review them by hand.
+
+### Usage
+
+```bash
+pip install -r requirements.txt
+
+# Greater Sydney (default)
+python candela_scraper.py -o candela_clinics.csv
+
+# Whole of NSW (long run)
+python candela_scraper.py --area nsw --max-sites 800
+
+# Only output confirmed Candela users
+python candela_scraper.py --eligible-only -o leads.csv
+
+# Websites only (faster, skips social)
+python candela_scraper.py --no-social
+```
+
+| Option | Description |
+| --- | --- |
+| `--area {nsw, sydney-metro, newcastle}` | Named area (default `sydney-metro`). |
+| `--bbox S W N E` | Custom bounding box. |
+| `-o, --output` | Output CSV (default `candela_clinics.csv`). |
+| `--max-sites N` | Max clinics to assess (default 400). |
+| `--max-pages N` | Max pages crawled per website (default 8). |
+| `--delay SECONDS` | Pause between requests (default 1.0). |
+| `--no-social` | Skip social-media checks. |
+| `--eligible-only` | Only write confirmed Candela clinics. |
+
+### Output columns
+
+```
+name, suburb, phone, website, eligible, matched_devices, evidence_url,
+evidence_source, instagram, facebook, pages_checked, osm_id
+```
+
+`eligible` is `yes`/`no`; `matched_devices` lists the Candela products found;
+`evidence_url` is the exact page the match came from.
+
+### Accuracy notes
+
+- **Detection is keyword-based.** Ambiguous product words (Matrix, Exion,
+  Profound, Ellipse, Frax, Serenity) only count when the "Candela" brand also
+  appears on the site, to avoid false positives. Strong brand/product names
+  (GentleLase, Vbeam, PicoWay, …) count on their own.
+- A `no` means "no public mention found", not a guarantee the clinic lacks the
+  device — treat the eligible list as warm leads and verify before outreach.
+- Social-media eligibility will be sparse because of platform blocking (above);
+  most matches will come from websites.
+
+### Compliance
+
+This reads only publicly published business information for B2B research.
+Australia's [Spam Act 2003](https://www.legislation.gov.au/Details/C2016C00614)
+and [Privacy Act 1988](https://www.oaic.gov.au/) still govern how you contact
+these businesses — get consent where required and honour unsubscribes. Don't
+use this to breach any platform's Terms of Service.
