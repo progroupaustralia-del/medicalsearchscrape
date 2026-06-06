@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import os
 import re
 import sys
 import time
@@ -174,6 +175,8 @@ class Lead:
     instagram: str = ""
     facebook: str = ""
     pages_checked: int = 0
+    lat: float | None = None
+    lon: float | None = None
     osm_id: str = ""
 
 
@@ -236,6 +239,8 @@ def osm_to_lead(el: dict) -> Lead | None:
         website=normalize_url(website),
         instagram=tags.get("contact:instagram", ""),
         facebook=tags.get("contact:facebook", ""),
+        lat=el.get("lat") or el.get("center", {}).get("lat"),
+        lon=el.get("lon") or el.get("center", {}).get("lon"),
         osm_id=f"{el.get('type')}/{el.get('id')}",
     )
 
@@ -438,11 +443,34 @@ def run(args) -> int:
     print(f"{len(leads)} candidate aesthetic/skin/laser clinics with a website.",
           file=sys.stderr)
 
+    # Optional Google Maps photo backend (set up once, lazily).
+    gmaps = None
+    if args.gmaps_photos:
+        api_key = args.gmaps_key or os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("--gmaps-photos needs a key: set GOOGLE_MAPS_API_KEY "
+                               "or pass --gmaps-key.")
+        import gmaps_photos
+        backends = gmaps_photos.make_backend(args.image_recognition, args.vision_model)
+        gmaps = (gmaps_photos, api_key, backends)
+        print(f"Google Maps photo check enabled ({args.image_recognition}).",
+              file=sys.stderr)
+
     robots = RobotsCache(session)
     for i, lead in enumerate(leads, 1):
         assess_website(session, robots, lead, args.delay, args.max_pages)
         if not args.no_social and not lead.eligible:
             assess_social(session, robots, lead, args.delay)
+        if gmaps and not lead.eligible:
+            gp, api_key, backends = gmaps
+            res = gp.find_candela_in_photos(
+                session, api_key, backends, lead.name, lead.suburb,
+                lead.lat, lead.lon, args.max_photos, args.delay)
+            if res["matched"]:
+                lead.eligible = True
+                lead.matched_devices = res["matched"]
+                lead.evidence_url = res["evidence_url"]
+                lead.evidence_source = res["source"]
         flag = ("CANDELA: " + ", ".join(lead.matched_devices)) if lead.eligible else "-"
         print(f"  [{i}/{len(leads)}] {lead.name[:38]:38s} {flag}", file=sys.stderr)
 
@@ -477,6 +505,20 @@ def parse_args(argv=None):
                    help="Skip social-media checks; assess websites only.")
     p.add_argument("--eligible-only", action="store_true",
                    help="Only write clinics confirmed to use a Candela device.")
+    # Google Maps photo signal (official Places API; billable, needs a key).
+    p.add_argument("--gmaps-photos", action="store_true",
+                   help="Also scan each clinic's Google Maps photos for a Candela "
+                        "device (official Places API; needs GOOGLE_MAPS_API_KEY).")
+    p.add_argument("--gmaps-key", default="",
+                   help="Google Maps API key (else read from GOOGLE_MAPS_API_KEY).")
+    p.add_argument("--image-recognition", choices=["ocr", "vision", "both"],
+                   default="ocr",
+                   help="How to read devices from photos: ocr (free, Tesseract), "
+                        "vision (Claude, needs ANTHROPIC_API_KEY), or both.")
+    p.add_argument("--max-photos", type=int, default=5,
+                   help="Max Google Maps photos to check per clinic (default: 5).")
+    p.add_argument("--vision-model", default="claude-opus-4-8",
+                   help="Claude model for the vision backend (default: claude-opus-4-8).")
     return p.parse_args(argv)
 
 

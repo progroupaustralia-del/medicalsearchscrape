@@ -1,0 +1,10 @@
+# Optional extras for the Google Maps photo check (candela_scraper --gmaps-photos)
+#
+# OCR backend (--image-recognition ocr): also install the Tesseract binary
+#   Debian/Ubuntu:  sudo apt-get install tesseract-ocr
+#   macOS (brew):   brew install tesseract
+pytesseract>=0.3.10
+pillow>=10.0.0
+#
+# Vision backend (--image-recognition vision): needs ANTHROPIC_API_KEY in the env
+anthropic>=0.40.0

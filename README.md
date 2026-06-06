@@ -174,6 +174,51 @@ evidence_source, instagram, facebook, pages_checked, osm_id
 - Social-media eligibility will be sparse because of platform blocking (above);
   most matches will come from websites.
 
+### Google Maps photo check (optional)
+
+Clinics often photograph their treatment rooms on their Google Business Profile,
+and a Candela machine's panel/branding is sometimes legible. `--gmaps-photos`
+pulls those photos and scans them for a Candela device.
+
+```bash
+export GOOGLE_MAPS_API_KEY=...           # Places API enabled, billing on
+pip install -r requirements-gmaps.txt    # extras for OCR / vision
+
+# OCR (free, reads visible text via Tesseract — also install the tesseract binary)
+python candela_scraper.py --gmaps-photos --image-recognition ocr
+
+# Claude vision (more accurate; needs ANTHROPIC_API_KEY; costs per image)
+export ANTHROPIC_API_KEY=sk-ant-...
+python candela_scraper.py --gmaps-photos --image-recognition vision
+
+# Both (vision first, OCR fallback)
+python candela_scraper.py --gmaps-photos --image-recognition both --max-photos 8
+```
+
+| Option | Description |
+| --- | --- |
+| `--gmaps-photos` | Enable the Google Maps photo check. |
+| `--gmaps-key KEY` | API key (else read from `GOOGLE_MAPS_API_KEY`). |
+| `--image-recognition {ocr, vision, both}` | How to read devices from photos (default `ocr`). |
+| `--max-photos N` | Photos to check per clinic (default 5). |
+| `--vision-model ID` | Claude model for the vision backend (default `claude-opus-4-8`). |
+
+A match is recorded with `evidence_source` = `gmaps-photo:ocr` or
+`gmaps-photo:vision`, and `evidence_url` points to the Maps listing.
+
+**How the photos are obtained — and the honest limits:**
+
+- Photos come **only** through Google's **official Places Photos API** (Find
+  Place → Place Details → Place Photo). Every call is **billable**. This tool
+  does **not** scrape the Google Maps website or map tiles — that breaks
+  Google's Terms of Service and is bot-blocked.
+- Recognising a *specific* laser model from a photo is unreliable: devices are
+  often in cabinets, out of shot, unbranded in the frame, or simply not
+  photographed. Expect this to confirm a minority of clinics. A hit is a strong
+  lead; a miss means "not found in photos", never "device absent".
+- The vision backend sends each photo to the Claude API. Only enable it for
+  clinics/photos you're comfortable sending to a third-party API.
+
 ### Compliance
 
 This reads only publicly published business information for B2B research.
